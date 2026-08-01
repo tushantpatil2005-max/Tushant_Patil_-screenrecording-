@@ -1,0 +1,1565 @@
+# Pipeline Builder — Full Source Code (single-file reference)
+
+Combined for review purposes. File paths are relative to the project root.
+
+
+---
+
+## `README.md`
+
+```markdown
+# Pipeline Builder
+
+A visual, drag-and-drop pipeline editor (React + ReactFlow) with a FastAPI
+backend that validates the graph you build.
+
+## Running it
+
+**Backend**
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+```
+
+**Frontend**
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Then open the printed local URL (default `http://localhost:3000`).
+
+The frontend expects the backend at `http://localhost:8000` by default. To
+point it elsewhere, add a `.env` file in `frontend/` with:
+```
+VITE_API_BASE=https://your-backend-host
+```
+
+## Part 1 — Node abstraction
+
+Every node type is a plain config object handed to `createNode()`
+(`src/nodes/nodeFactory.jsx`), which wires it up to `BaseNode`
+(`src/nodes/BaseNode.jsx`) — the shared component that renders the header,
+fields, and handles. A brand-new node is typically ~15 lines:
+
+```jsx
+export const MathNode = createNode({
+  type: 'math',
+  title: 'Math Op',
+  accent: '#db2777',
+  fields: [{ name: 'operation', label: 'Operation', type: 'select', options: [...] }],
+  handles: [
+    { id: 'a', type: 'target', position: Position.Left, style: { top: '35%' } },
+    { id: 'b', type: 'target', position: Position.Left, style: { top: '65%' } },
+    { id: 'result', type: 'source', position: Position.Right },
+  ],
+});
+```
+
+`fields`/`handles` can also be functions of `(data, id)`, which is how the
+Text node grows new handles as the user types (see Part 3). Five new nodes
+are included to demonstrate the abstraction: Math Op, Filter, Delay,
+HTTP Request, and DB Query (`src/nodes/*.jsx`), alongside the original
+Input, Output, LLM, and Text nodes.
+
+## Part 2 — Styling
+
+All nodes share one visual language defined in `src/nodes/nodes.css` and
+`src/App.css`: a dark silkscreen-style header, square "component lead"
+style ports, and a monospace label face (JetBrains Mono) paired with a
+system sans for field values — meant to read like a small schematic/PCB
+module rather than a generic card. Each node type gets a single accent
+color (set via a `--accent-node` CSS variable) that tints its header
+border, chip, and ports, so telling node types apart at a glance doesn't
+require reading labels.
+
+## Part 3 — Text node logic
+
+`src/nodes/TextNode.jsx` handles both requirements:
+- **Auto-resize**: the textarea's height tracks `scrollHeight` on every
+  keystroke, and the node's width grows with the longest line (clamped
+  between a min/max) so the box is never cramped or wastefully huge.
+- **Variable handles**: input is scanned with `/\{\{\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\}\}/g`
+  (a valid JS identifier inside double curly braces). Each unique match
+  becomes a target `Handle` on the left edge, evenly spaced, and handles
+  disappear again if the variable is removed from the text.
+
+## Part 4 — Backend integration
+
+- `src/submit.js` exports `useSubmitPipeline()`, a hook that reads the
+  current nodes/edges from the store and `POST`s them as JSON to
+  `/pipelines/parse`, then shows an `alert()` with the response.
+- `backend/main.py` implements `/pipelines/parse`: it counts nodes and
+  edges, and determines whether the graph is a DAG via Kahn's algorithm
+  (repeatedly removing zero-in-degree nodes — if every node gets removed,
+  there's no cycle). Response shape: `{ num_nodes, num_edges, is_dag }`.
+
+## Notes
+
+This was built and syntax-checked in a sandboxed environment without
+package-registry access, so `npm install` / `pip install` haven't been run
+end-to-end here — run them locally as the first step above.
+```
+
+---
+
+## `backend/main.py`
+
+```python
+from typing import Any, Dict, List
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI(title="Pipeline Backend")
+
+# Allow the Vite dev server (and any other origin) to call this API from the browser.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def read_root():
+    return {"Ping": "Pong"}
+
+
+class PipelineRequest(BaseModel):
+    # Accept ReactFlow's node/edge objects as loosely-typed dicts so the
+    # endpoint isn't coupled to exactly which extra fields the frontend
+    # attaches (position, width, selected, data, etc).
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+
+
+def is_dag(node_ids: List[str], edges: List[Dict[str, Any]]) -> bool:
+    """Kahn's algorithm: repeatedly remove nodes with in-degree 0. If every
+    node can eventually be removed, there's no cycle -> it's a DAG."""
+    adjacency: Dict[str, List[str]] = {nid: [] for nid in node_ids}
+    in_degree: Dict[str, int] = {nid: 0 for nid in node_ids}
+
+    for edge in edges:
+        source = edge.get("source")
+        target = edge.get("target")
+        # Ignore edges pointing to/from nodes we don't know about, rather
+        # than raising, so a malformed edge can't crash the whole request.
+        if source not in adjacency or target not in adjacency:
+            continue
+        adjacency[source].append(target)
+        in_degree[target] += 1
+
+    queue = [nid for nid, deg in in_degree.items() if deg == 0]
+    visited = 0
+
+    while queue:
+        current = queue.pop()
+        visited += 1
+        for neighbor in adjacency[current]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    return visited == len(node_ids)
+
+
+@app.post("/pipelines/parse")
+def parse_pipeline(pipeline: PipelineRequest) -> Dict[str, Any]:
+    node_ids = [node.get("id") for node in pipeline.nodes if node.get("id") is not None]
+
+    num_nodes = len(pipeline.nodes)
+    num_edges = len(pipeline.edges)
+    dag = is_dag(node_ids, pipeline.edges) if num_nodes > 0 else True
+
+    return {
+        "num_nodes": num_nodes,
+        "num_edges": num_edges,
+        "is_dag": dag,
+    }
+```
+
+---
+
+## `backend/requirements.txt`
+
+```text
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.6.0
+```
+
+---
+
+## `frontend/index.html`
+
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" />
+    <link
+      href="https://cdnjs.cloudflare.com/ajax/libs/jetbrains-mono/2.304/css/jetbrains-mono.min.css"
+      rel="stylesheet"
+    />
+    <title>Pipeline Builder</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+```
+
+---
+
+## `frontend/package.json`
+
+```json
+{
+  "name": "pipeline-builder-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "reactflow": "^11.11.4",
+    "zustand": "^4.5.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.2"
+  }
+}
+```
+
+---
+
+## `frontend/src/App.css`
+
+```css
+.vs-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ---------- Header ---------- */
+
+.vs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  height: 56px;
+  min-height: 56px;
+  background: var(--ink);
+  border-bottom: 1px solid var(--ink-soft);
+  z-index: 20;
+}
+
+.vs-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.vs-brand-mark {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--accent);
+  border-radius: 3px;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.vs-brand-mark::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  background: var(--accent);
+  border-radius: 1px;
+  transform: translate(-50%, -50%);
+}
+
+.vs-brand-name {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #f2f3f5;
+}
+
+.vs-brand-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--slate-dim);
+  letter-spacing: 0.04em;
+}
+
+/* ---------- Main split ---------- */
+
+.vs-main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ---------- Toolbar rail (parts bin) ---------- */
+
+.vs-toolbar {
+  width: 232px;
+  min-width: 232px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  padding: 18px 14px;
+  overflow-y: auto;
+}
+
+.vs-toolbar-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--slate-dim);
+  margin: 0 4px 12px;
+}
+
+.vs-toolbar-nodes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.vs-draggable-node {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  cursor: grab;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink-soft);
+  transition: border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
+  user-select: none;
+}
+
+.vs-draggable-node:hover {
+  border-color: var(--accent-node, var(--accent));
+  box-shadow: 0 1px 4px rgba(20, 22, 26, 0.08);
+  transform: translateX(2px);
+}
+
+.vs-draggable-node:active {
+  cursor: grabbing;
+}
+
+.vs-draggable-chip {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  background: var(--accent-node, var(--accent));
+}
+
+.vs-draggable-label {
+  flex: 1;
+}
+
+.vs-draggable-io {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--slate-dim);
+}
+
+/* ---------- Canvas ---------- */
+
+.vs-canvas {
+  flex: 1;
+  height: 100%;
+  position: relative;
+}
+
+.vs-canvas .react-flow__controls {
+  box-shadow: 0 1px 6px rgba(20, 22, 26, 0.12);
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+
+.vs-canvas .react-flow__controls-button {
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.vs-canvas .react-flow__minimap {
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  box-shadow: 0 1px 6px rgba(20, 22, 26, 0.12);
+}
+
+.vs-canvas .react-flow__edge-path {
+  stroke: var(--slate-dim);
+  stroke-width: 1.6;
+}
+
+.vs-canvas .react-flow__edge.selected .react-flow__edge-path,
+.vs-canvas .react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--accent);
+}
+
+/* ---------- Submit / run control ---------- */
+
+.vs-submit-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  color: #f2f3f5;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.vs-submit-btn:hover {
+  background: var(--accent);
+  color: var(--ink);
+}
+
+.vs-submit-btn:active {
+  transform: translateY(1px);
+}
+
+.vs-submit-btn .vs-play {
+  font-size: 9px;
+}
+```
+
+---
+
+## `frontend/src/App.jsx`
+
+```jsx
+import { ReactFlowProvider } from 'reactflow';
+import { PipelineToolbar } from './toolbar';
+import { PipelineUI } from './ui';
+import { useSubmitPipeline } from './submit';
+import './App.css';
+
+function App() {
+  const handleSubmit = useSubmitPipeline();
+
+  return (
+    <ReactFlowProvider>
+      <div className="vs-app">
+        <header className="vs-header">
+          <div className="vs-brand">
+            <span className="vs-brand-mark" />
+            <span className="vs-brand-name">Pipeline Builder</span>
+            <span className="vs-brand-sub">// node editor</span>
+          </div>
+          <button className="vs-submit-btn" onClick={handleSubmit}>
+            <span className="vs-play">▶</span>
+            Run Pipeline
+          </button>
+        </header>
+
+        <div className="vs-main">
+          <PipelineToolbar />
+          <PipelineUI />
+        </div>
+      </div>
+    </ReactFlowProvider>
+  );
+}
+
+export default App;
+```
+
+---
+
+## `frontend/src/draggableNode.jsx`
+
+```jsx
+export const DraggableNode = ({ type, label, accent, io }) => {
+  const onDragStart = (event) => {
+    const appData = { nodeType: type };
+    event.dataTransfer.setData('application/reactflow', JSON.stringify(appData));
+    event.dataTransfer.effectAllowed = 'move';
+    event.currentTarget.style.cursor = 'grabbing';
+  };
+
+  const onDragEnd = (event) => {
+    event.currentTarget.style.cursor = 'grab';
+  };
+
+  return (
+    <div
+      className="vs-draggable-node"
+      style={{ '--accent-node': accent }}
+      draggable
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+    >
+      <span className="vs-draggable-chip" />
+      <span className="vs-draggable-label">{label}</span>
+      {io && <span className="vs-draggable-io">{io}</span>}
+    </div>
+  );
+};
+```
+
+---
+
+## `frontend/src/index.css`
+
+```css
+:root {
+  /* Color tokens */
+  --ink: #14161a;
+  --ink-soft: #2a2d34;
+  --paper: #eef0f3;
+  --panel: #ffffff;
+  --slate: #5b6373;
+  --slate-dim: #8891a1;
+  --line: #dbdee3;
+  --line-strong: #c2c6ce;
+  --accent: #e8933a;
+  --accent-soft: #fbe4c8;
+  --danger: #d5473f;
+  --success: #16a34a;
+
+  /* Type */
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-body);
+  background: var(--paper);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+```
+
+---
+
+## `frontend/src/main.jsx`
+
+```jsx
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+import './index.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+```
+
+---
+
+## `frontend/src/nodes/BaseNode.jsx`
+
+```jsx
+import { useCallback } from 'react';
+import { Handle } from 'reactflow';
+import { useStore } from '../store';
+import './nodes.css';
+
+/**
+ * BaseNode renders the shared chrome for every node on the canvas: a
+ * silkscreen-style header, a body of config fields, and a set of
+ * connection handles (ports). Individual node types are defined by
+ * *config* (see nodeFactory.jsx) rather than by writing new markup,
+ * so adding a node is a matter of describing its fields/handles.
+ *
+ * Props:
+ *  - id, data          : standard ReactFlow node props
+ *  - title             : display name shown in the header
+ *  - accent            : hex color used for this node type's chip/border/ports
+ *  - fields            : [{ name, label, type, options?, defaultValue?, rows? }]
+ *  - handles           : [{ id, type: 'source'|'target', position, label?, style? }]
+ *  - ioTag             : optional override string for the header's io count tag
+ *  - children          : extra custom content rendered below the fields
+ */
+export const BaseNode = ({
+  id,
+  data,
+  title,
+  accent = '#e8933a',
+  fields = [],
+  handles = [],
+  ioTag,
+  minWidth = 220,
+  children,
+}) => {
+  const updateNodeField = useStore((state) => state.updateNodeField);
+
+  const handleChange = useCallback(
+    (fieldName, value) => {
+      updateNodeField(id, fieldName, value);
+    },
+    [id, updateNodeField]
+  );
+
+  const inCount = handles.filter((h) => h.type === 'target').length;
+  const outCount = handles.filter((h) => h.type === 'source').length;
+  const computedIoTag = ioTag ?? `IN·${inCount} OUT·${outCount}`;
+
+  return (
+    <div className="vs-node" style={{ minWidth, '--accent-node': accent }}>
+      <div className="vs-node-header">
+        <span className="vs-node-chip" />
+        <span className="vs-node-title">{title}</span>
+        <span className="vs-node-io-tag">{computedIoTag}</span>
+      </div>
+
+      <div className="vs-node-body">
+        {fields.map((field) => (
+          <div className="vs-field" key={field.name}>
+            <label className="vs-field-label">{field.label}</label>
+            {renderField(field, data, handleChange)}
+          </div>
+        ))}
+        {children}
+      </div>
+
+      {handles.map((handle) => (
+        <Handle
+          key={handle.id}
+          id={handle.id}
+          type={handle.type}
+          position={handle.position}
+          style={handle.style}
+          className={`vs-handle vs-handle-${handle.type}`}
+        />
+      ))}
+    </div>
+  );
+};
+
+function renderField(field, data, handleChange) {
+  const value = data?.[field.name] ?? field.defaultValue ?? '';
+
+  switch (field.type) {
+    case 'select':
+      return (
+        <select
+          className="vs-select"
+          value={value}
+          onChange={(e) => handleChange(field.name, e.target.value)}
+        >
+          {field.options.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+      );
+
+    case 'textarea':
+      return (
+        <textarea
+          className="vs-textarea"
+          rows={field.rows || 2}
+          value={value}
+          onChange={(e) => handleChange(field.name, e.target.value)}
+        />
+      );
+
+    case 'number':
+      return (
+        <input
+          type="number"
+          className="vs-input"
+          value={value}
+          onChange={(e) => handleChange(field.name, e.target.value)}
+        />
+      );
+
+    case 'checkbox':
+      return (
+        <div className="vs-node-checkbox-row">
+          <input
+            type="checkbox"
+            checked={!!value}
+            onChange={(e) => handleChange(field.name, e.target.checked)}
+          />
+        </div>
+      );
+
+    default:
+      return (
+        <input
+          type="text"
+          className="vs-input"
+          value={value}
+          onChange={(e) => handleChange(field.name, e.target.value)}
+        />
+      );
+  }
+}
+```
+
+---
+
+## `frontend/src/nodes/DatabaseNode.jsx`
+
+```jsx
+import { Position } from 'reactflow';
+import { createNode } from './nodeFactory';
+
+export const DatabaseNode = createNode({
+  type: 'database',
+  title: 'DB Query',
+  accent: '#ca8a04',
+  fields: [
+    { name: 'query', label: 'SQL Query', type: 'textarea', rows: 3, defaultValue: 'SELECT * FROM table' },
+  ],
+  handles: [
+    { id: 'params', type: 'target', position: Position.Left },
+    { id: 'rows', type: 'source', position: Position.Right },
+  ],
+});
+```
+
+---
+
+## `frontend/src/nodes/DelayNode.jsx`
+
+```jsx
+import { Position } from 'reactflow';
+import { createNode } from './nodeFactory';
+
+export const DelayNode = createNode({
+  type: 'delay',
+  title: 'Delay',
+  accent: '#64748b',
+  fields: [{ name: 'duration', label: 'Duration (ms)', type: 'number', defaultValue: 1000 }],
+  handles: [
+    { id: 'input', type: 'target', position: Position.Left },
+    { id: 'output', type: 'source', position: Position.Right },
+  ],
+});
+```
+
+---
+
+## `frontend/src/nodes/FilterNode.jsx`
+
+```jsx
+import { Position } from 'reactflow';
+import { createNode } from './nodeFactory';
+
+export const FilterNode = createNode({
+  type: 'filter',
+  title: 'Filter',
+  accent: '#0d9488',
+  fields: [{ name: 'condition', label: 'Condition', type: 'text', defaultValue: 'value > 0' }],
+  handles: [
+    { id: 'input', type: 'target', position: Position.Left },
+    { id: 'pass', type: 'source', position: Position.Right, style: { top: '35%' } },
+    { id: 'fail', type: 'source', position: Position.Right, style: { top: '65%' } },
+  ],
+});
+```
+
+---
+
+## `frontend/src/nodes/HttpRequestNode.jsx`
+
+```jsx
+import { Position } from 'reactflow';
+import { createNode } from './nodeFactory';
+
+export const HttpRequestNode = createNode({
+  type: 'httpRequest',
+  title: 'HTTP Request',
+  accent: '#0891b2',
+  fields: [
+    {
+      name: 'method',
+      label: 'Method',
+      type: 'select',
+      defaultValue: 'GET',
+      options: [
+        { value: 'GET', label: 'GET' },
+        { value: 'POST', label: 'POST' },
+        { value: 'PUT', label: 'PUT' },
+        { value: 'DELETE', label: 'DELETE' },
+      ],
+    },
+    { name: 'url', label: 'URL', type: 'text', defaultValue: 'https://api.example.com' },
+  ],
+  handles: [
+    { id: 'body', type: 'target', position: Position.Left },
+    { id: 'response', type: 'source', position: Position.Right },
+  ],
+});
+```
+
+---
+
+## `frontend/src/nodes/InputNode.jsx`
+
+```jsx
+import { Position } from 'reactflow';
+import { createNode } from './nodeFactory';
+
+export const InputNode = createNode({
+  type: 'customInput',
+  title: 'Input',
+  accent: '#3b82f6',
+  fields: [
+    { name: 'inputName', label: 'Name', type: 'text', defaultValue: 'input_1' },
+    {
+      name: 'inputType',
+      label: 'Type',
+      type: 'select',
+      defaultValue: 'Text',
+      options: [
+        { value: 'Text', label: 'Text' },
+        { value: 'File', label: 'File' },
+      ],
+    },
+  ],
+  handles: [{ id: 'value', type: 'source', position: Position.Right }],
+});
+```
+
+---
+
+## `frontend/src/nodes/LLMNode.jsx`
+
+```jsx
+import { Position } from 'reactflow';
+import { createNode } from './nodeFactory';
+
+export const LLMNode = createNode({
+  type: 'llm',
+  title: 'LLM',
+  accent: '#e8933a',
+  fields: [
+    {
+      name: 'model',
+      label: 'Model',
+      type: 'select',
+      defaultValue: 'gpt-4',
+      options: [
+        { value: 'gpt-4', label: 'GPT-4' },
+        { value: 'claude', label: 'Claude' },
+        { value: 'gemini', label: 'Gemini' },
+      ],
+    },
+  ],
+  handles: [
+    { id: 'system', type: 'target', position: Position.Left, style: { top: '35%' } },
+    { id: 'prompt', type: 'target', position: Position.Left, style: { top: '65%' } },
+    { id: 'response', type: 'source', position: Position.Right },
+  ],
+});
+```
+
+---
+
+## `frontend/src/nodes/MathNode.jsx`
+
+```jsx
+import { Position } from 'reactflow';
+import { createNode } from './nodeFactory';
+
+export const MathNode = createNode({
+  type: 'math',
+  title: 'Math Op',
+  accent: '#db2777',
+  fields: [
+    {
+      name: 'operation',
+      label: 'Operation',
+      type: 'select',
+      defaultValue: 'add',
+      options: [
+        { value: 'add', label: 'Add' },
+        { value: 'subtract', label: 'Subtract' },
+        { value: 'multiply', label: 'Multiply' },
+        { value: 'divide', label: 'Divide' },
+      ],
+    },
+  ],
+  handles: [
+    { id: 'a', type: 'target', position: Position.Left, style: { top: '35%' } },
+    { id: 'b', type: 'target', position: Position.Left, style: { top: '65%' } },
+    { id: 'result', type: 'source', position: Position.Right },
+  ],
+});
+```
+
+---
+
+## `frontend/src/nodes/OutputNode.jsx`
+
+```jsx
+import { Position } from 'reactflow';
+import { createNode } from './nodeFactory';
+
+export const OutputNode = createNode({
+  type: 'customOutput',
+  title: 'Output',
+  accent: '#16a34a',
+  fields: [
+    { name: 'outputName', label: 'Name', type: 'text', defaultValue: 'output_1' },
+    {
+      name: 'outputType',
+      label: 'Type',
+      type: 'select',
+      defaultValue: 'Text',
+      options: [
+        { value: 'Text', label: 'Text' },
+        { value: 'Image', label: 'Image' },
+      ],
+    },
+  ],
+  handles: [{ id: 'value', type: 'target', position: Position.Left }],
+});
+```
+
+---
+
+## `frontend/src/nodes/TextNode.jsx`
+
+```jsx
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Handle, Position } from 'reactflow';
+import { useStore } from '../store';
+import './nodes.css';
+
+// Matches {{ variableName }} where variableName is a valid JS identifier
+const VARIABLE_PATTERN = /\{\{\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\}\}/g;
+
+function extractVariables(text) {
+  const found = [];
+  const seen = new Set();
+  let match;
+  VARIABLE_PATTERN.lastIndex = 0;
+  while ((match = VARIABLE_PATTERN.exec(text)) !== null) {
+    const name = match[1];
+    if (!seen.has(name)) {
+      seen.add(name);
+      found.push(name);
+    }
+  }
+  return found;
+}
+
+const MIN_WIDTH = 220;
+const MAX_WIDTH = 480;
+
+export const TextNode = ({ id, data }) => {
+  const updateNodeField = useStore((state) => state.updateNodeField);
+  const [text, setText] = useState(data?.text ?? 'Hello {{name}}');
+  const textareaRef = useRef(null);
+
+  const variables = useMemo(() => extractVariables(text), [text]);
+
+  // Persist text + derived variables into the shared store so the
+  // pipeline (and backend submission) always reflects current state.
+  useEffect(() => {
+    updateNodeField(id, 'text', text);
+  }, [text, id, updateNodeField]);
+
+  // Auto-resize height to fit content.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (el) {
+      el.style.height = 'auto';
+      el.style.height = `${el.scrollHeight}px`;
+    }
+  }, [text]);
+
+  // Auto-resize width based on the longest line, clamped to a sane range.
+  const width = useMemo(() => {
+    const lines = text.split('\n');
+    const longest = lines.reduce((a, b) => (b.length > a.length ? b : a), '');
+    const estimated = longest.length * 7.5 + 56;
+    return Math.min(Math.max(estimated, MIN_WIDTH), MAX_WIDTH);
+  }, [text]);
+
+  return (
+    <div className="vs-node" style={{ width, '--accent-node': '#7c3aed' }}>
+      <div className="vs-node-header">
+        <span className="vs-node-chip" />
+        <span className="vs-node-title">Text</span>
+        <span className="vs-node-io-tag">IN·{variables.length} OUT·1</span>
+      </div>
+
+      <div className="vs-node-body">
+        <label className="vs-field-label">Text</label>
+        <textarea
+          ref={textareaRef}
+          className="vs-textarea vs-textarea-auto"
+          value={text}
+          rows={1}
+          onChange={(e) => setText(e.target.value)}
+        />
+        {variables.length > 0 && (
+          <div className="vs-var-hint">
+            Variables: {variables.map((v) => `{{${v}}}`).join(', ')}
+          </div>
+        )}
+      </div>
+
+      {/* One target handle per detected {{variable}}, evenly spaced down the left edge */}
+      {variables.map((varName, idx) => (
+        <Handle
+          key={varName}
+          id={varName}
+          type="target"
+          position={Position.Left}
+          style={{ top: `${((idx + 1) / (variables.length + 1)) * 100}%` }}
+          className="vs-handle vs-handle-target"
+        />
+      ))}
+
+      <Handle id="output" type="source" position={Position.Right} className="vs-handle vs-handle-source" />
+    </div>
+  );
+};
+```
+
+---
+
+## `frontend/src/nodes/nodeFactory.jsx`
+
+```jsx
+import { BaseNode } from './BaseNode';
+
+/**
+ * createNode(config) is the entire "new node" abstraction. Instead of
+ * copy-pasting a node file and rewriting handles/state wiring, a new
+ * node type is just a config object describing what it looks like:
+ *
+ *   export const MathNode = createNode({
+ *     type: 'math',
+ *     title: 'Math Operation',
+ *     accent: '#db2777',
+ *     fields: [{ name: 'operation', label: 'Operation', type: 'select', options: [...] }],
+ *     handles: [
+ *       { id: 'a', type: 'target', position: Position.Left, style: { top: '35%' } },
+ *       { id: 'b', type: 'target', position: Position.Left, style: { top: '65%' } },
+ *       { id: 'result', type: 'source', position: Position.Right },
+ *     ],
+ *   });
+ *
+ * `fields` and `handles` may also be functions of (data, id) so a node's
+ * shape can react to its own state (this is how the Text node grows new
+ * handles as the user types new {{variables}} - see TextNode.jsx).
+ */
+export function createNode(config) {
+  const NodeComponent = ({ id, data }) => {
+    const fields = typeof config.fields === 'function' ? config.fields(data, id) : config.fields || [];
+    const handles = typeof config.handles === 'function' ? config.handles(data, id) : config.handles || [];
+
+    return (
+      <BaseNode
+        id={id}
+        data={data}
+        title={config.title}
+        accent={config.accent}
+        fields={fields}
+        handles={handles}
+        ioTag={config.ioTag}
+        minWidth={config.minWidth}
+      >
+        {config.render ? config.render(data, id) : null}
+      </BaseNode>
+    );
+  };
+
+  NodeComponent.displayName = `Node(${config.type})`;
+  return NodeComponent;
+}
+```
+
+---
+
+## `frontend/src/nodes/nodes.css`
+
+```css
+.vs-node {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-family: var(--font-body);
+  min-width: 220px;
+  position: relative;
+  box-shadow: 0 1px 3px rgba(20, 22, 26, 0.06);
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.vs-node:hover {
+  box-shadow: 0 4px 14px rgba(20, 22, 26, 0.1);
+  border-color: var(--line-strong);
+}
+
+.vs-node.selected {
+  border-color: var(--accent-node, var(--accent));
+}
+
+/* Header reads like a component silkscreen label */
+.vs-node-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--ink);
+  border-radius: 7px 7px 0 0;
+  border-bottom: 2px solid var(--accent-node, var(--accent));
+}
+
+.vs-node-chip {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--accent-node, var(--accent));
+  flex-shrink: 0;
+}
+
+.vs-node-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #f2f3f5;
+  flex: 1;
+}
+
+.vs-node-io-tag {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--slate-dim);
+  letter-spacing: 0.02em;
+}
+
+.vs-node-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vs-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vs-field-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--slate);
+}
+
+.vs-input,
+.vs-select,
+.vs-textarea {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 6px 8px;
+  font-size: 12.5px;
+  color: var(--ink);
+  background: var(--paper);
+  font-family: var(--font-body);
+  transition: border-color 0.12s ease, background 0.12s ease;
+  width: 100%;
+}
+
+.vs-input:focus,
+.vs-select:focus,
+.vs-textarea:focus {
+  outline: none;
+  border-color: var(--accent-node, var(--accent));
+  background: var(--panel);
+}
+
+.vs-textarea {
+  resize: none;
+  line-height: 1.45;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.vs-textarea-auto {
+  overflow: hidden;
+  min-height: 34px;
+}
+
+.vs-var-hint {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--accent-node, var(--accent));
+  background: color-mix(in srgb, var(--accent-node, var(--accent)) 12%, white);
+  border-radius: 4px;
+  padding: 4px 7px;
+}
+
+.vs-node-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Ports - square pads like component leads, not generic dots */
+.vs-handle {
+  width: 10px !important;
+  height: 10px !important;
+  border-radius: 2px !important;
+  background: var(--panel) !important;
+  border: 2px solid var(--accent-node, var(--accent)) !important;
+}
+
+.vs-handle-source {
+  background: var(--accent-node, var(--accent)) !important;
+}
+
+.vs-handle-target {
+  background: var(--panel) !important;
+}
+
+.vs-handle-label {
+  position: absolute;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--slate-dim);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.vs-handle-label-left {
+  left: 12px;
+}
+
+.vs-handle-label-right {
+  right: 12px;
+}
+```
+
+---
+
+## `frontend/src/store.js`
+
+```jsx
+import { create } from 'zustand';
+import { addEdge, applyNodeChanges, applyEdgeChanges, MarkerType } from 'reactflow';
+
+export const useStore = create((set, get) => ({
+  nodes: [],
+  edges: [],
+  nodeIDs: {},
+
+  // Generates a unique, human-readable id per node type, e.g. "text-1", "text-2"
+  getNodeID: (type) => {
+    const nodeIDs = { ...get().nodeIDs };
+    if (nodeIDs[type] === undefined) nodeIDs[type] = 0;
+    nodeIDs[type] += 1;
+    set({ nodeIDs });
+    return `${type}-${nodeIDs[type]}`;
+  },
+
+  addNode: (node) => set({ nodes: [...get().nodes, node] }),
+
+  onNodesChange: (changes) => {
+    set({ nodes: applyNodeChanges(changes, get().nodes) });
+  },
+
+  onEdgesChange: (changes) => {
+    set({ edges: applyEdgeChanges(changes, get().edges) });
+  },
+
+  onConnect: (connection) => {
+    set({
+      edges: addEdge(
+        {
+          ...connection,
+          type: 'smoothstep',
+          animated: false,
+          markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16 },
+        },
+        get().edges
+      ),
+    });
+  },
+
+  // Merges a single field update into a node's `data` object.
+  updateNodeField: (nodeId, fieldName, value) => {
+    set({
+      nodes: get().nodes.map((node) =>
+        node.id === nodeId ? { ...node, data: { ...node.data, [fieldName]: value } } : node
+      ),
+    });
+  },
+}));
+```
+
+---
+
+## `frontend/src/submit.js`
+
+```jsx
+import { useStore } from './store';
+
+// Points at the local FastAPI backend by default; override with a .env
+// entry (VITE_API_BASE=https://your-host) for a deployed backend.
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
+
+/**
+ * useSubmitPipeline reads the current nodes/edges out of the store and
+ * POSTs them to the backend's /pipelines/parse endpoint, then alerts
+ * the user with a friendly summary of the response.
+ */
+export function useSubmitPipeline() {
+  const nodes = useStore((state) => state.nodes);
+  const edges = useStore((state) => state.edges);
+
+  return async function handleSubmit() {
+    if (nodes.length === 0) {
+      alert('Add at least one node to the canvas before submitting.');
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE}/pipelines/parse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodes, edges }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server responded with status ${response.status}`);
+      }
+
+      const { num_nodes, num_edges, is_dag } = await response.json();
+
+      alert(
+        'Pipeline Analysis\n' +
+          '——————————————\n' +
+          `Nodes: ${num_nodes}\n` +
+          `Edges: ${num_edges}\n` +
+          `Forms a DAG: ${is_dag ? 'Yes ✅' : 'No ❌ (cycle detected)'}`
+      );
+    } catch (err) {
+      alert(`Couldn't reach the backend at ${API_BASE}.\n\n${err.message}`);
+    }
+  };
+}
+```
+
+---
+
+## `frontend/src/toolbar.jsx`
+
+```jsx
+import { DraggableNode } from './draggableNode';
+
+const NODE_CATALOG = [
+  { type: 'customInput', label: 'Input', accent: '#3b82f6', io: 'OUT·1' },
+  { type: 'llm', label: 'LLM', accent: '#e8933a', io: 'IN·2 OUT·1' },
+  { type: 'customOutput', label: 'Output', accent: '#16a34a', io: 'IN·1' },
+  { type: 'text', label: 'Text', accent: '#7c3aed', io: 'IN·* OUT·1' },
+  { type: 'math', label: 'Math Op', accent: '#db2777', io: 'IN·2 OUT·1' },
+  { type: 'filter', label: 'Filter', accent: '#0d9488', io: 'IN·1 OUT·2' },
+  { type: 'delay', label: 'Delay', accent: '#64748b', io: 'IN·1 OUT·1' },
+  { type: 'httpRequest', label: 'HTTP Request', accent: '#0891b2', io: 'IN·1 OUT·1' },
+  { type: 'database', label: 'DB Query', accent: '#ca8a04', io: 'IN·1 OUT·1' },
+];
+
+export const PipelineToolbar = () => {
+  return (
+    <aside className="vs-toolbar">
+      <p className="vs-toolbar-title">Components</p>
+      <div className="vs-toolbar-nodes">
+        {NODE_CATALOG.map((n) => (
+          <DraggableNode key={n.type} {...n} />
+        ))}
+      </div>
+    </aside>
+  );
+};
+```
+
+---
+
+## `frontend/src/ui.jsx`
+
+```jsx
+import { useCallback, useRef, useState } from 'react';
+import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
+import { shallow } from 'zustand/shallow';
+import 'reactflow/dist/style.css';
+
+import { useStore } from './store';
+import { InputNode } from './nodes/InputNode';
+import { OutputNode } from './nodes/OutputNode';
+import { LLMNode } from './nodes/LLMNode';
+import { TextNode } from './nodes/TextNode';
+import { MathNode } from './nodes/MathNode';
+import { FilterNode } from './nodes/FilterNode';
+import { DelayNode } from './nodes/DelayNode';
+import { HttpRequestNode } from './nodes/HttpRequestNode';
+import { DatabaseNode } from './nodes/DatabaseNode';
+
+const nodeTypes = {
+  customInput: InputNode,
+  customOutput: OutputNode,
+  llm: LLMNode,
+  text: TextNode,
+  math: MathNode,
+  filter: FilterNode,
+  delay: DelayNode,
+  httpRequest: HttpRequestNode,
+  database: DatabaseNode,
+};
+
+const selector = (state) => ({
+  nodes: state.nodes,
+  edges: state.edges,
+  getNodeID: state.getNodeID,
+  addNode: state.addNode,
+  onNodesChange: state.onNodesChange,
+  onEdgesChange: state.onEdgesChange,
+  onConnect: state.onConnect,
+});
+
+export const PipelineUI = () => {
+  const wrapperRef = useRef(null);
+  const [reactFlowInstance, setReactFlowInstance] = useState(null);
+  const { nodes, edges, getNodeID, addNode, onNodesChange, onEdgesChange, onConnect } = useStore(
+    selector,
+    shallow
+  );
+
+  const onDrop = useCallback(
+    (event) => {
+      event.preventDefault();
+      const raw = event.dataTransfer.getData('application/reactflow');
+      if (!raw || !reactFlowInstance) return;
+
+      const { nodeType } = JSON.parse(raw);
+      if (!nodeType) return;
+
+      const bounds = wrapperRef.current.getBoundingClientRect();
+      const position = reactFlowInstance.project({
+        x: event.clientX - bounds.left,
+        y: event.clientY - bounds.top,
+      });
+
+      const nodeID = getNodeID(nodeType);
+      addNode({
+        id: nodeID,
+        type: nodeType,
+        position,
+        data: { id: nodeID, nodeType },
+      });
+    },
+    [reactFlowInstance, getNodeID, addNode]
+  );
+
+  const onDragOver = useCallback((event) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+  }, []);
+
+  return (
+    <div className="vs-canvas" ref={wrapperRef}>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        nodeTypes={nodeTypes}
+        onDrop={onDrop}
+        onDragOver={onDragOver}
+        onInit={setReactFlowInstance}
+        proOptions={{ hideAttribution: true }}
+        fitView
+      >
+        <Background gap={18} size={1.4} color="#c2c6ce" variant="dots" />
+        <Controls />
+        <MiniMap pannable zoomable nodeStrokeWidth={2} nodeColor="#dbdee3" />
+      </ReactFlow>
+    </div>
+  );
+};
+```
+
+---
+
+## `frontend/vite.config.js`
+
+```jsx
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 3000,
+  },
+});
+```
